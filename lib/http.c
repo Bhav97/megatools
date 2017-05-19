@@ -376,26 +376,38 @@ again:
   return res;
 }
 
-gboolean http_post_stream_download(http* h, const gchar* url, http_data_fn write_cb, gpointer user_data, GError** err)
+gboolean http_get_stream_download(http* h, const gchar* url, http_data_fn write_cb, gpointer user_data, gint64 file_size, goffset resume_from, GError** err)
 {
   struct curl_slist* headers = NULL;
   glong http_status = 0;
   CURLcode res;
   struct _stream_data data;
   gboolean status = FALSE;
+  gchar* range;
 
   g_return_val_if_fail(h != NULL, FALSE);
   g_return_val_if_fail(url != NULL, FALSE);
+  g_return_val_if_fail(file_size > 0, FALSE);
+  g_return_val_if_fail(resume_from >= 0, FALSE);
   g_return_val_if_fail(err == NULL || *err == NULL, FALSE);
 
   http_no_expect(h);
 
+  range = g_strdup_printf("%lu-%lu", resume_from, file_size);
+  if (!range)
+  {
+    g_set_error(err, HTTP_ERROR, HTTP_ERROR_OTHER, "Memory allocation failed");
+    goto out;
+  }
+
+  // GET request instead of POST
   // setup post headers and url
-  curl_easy_setopt(h->curl, CURLOPT_POST, 1L);
+  curl_easy_setopt(h->curl, CURLOPT_HTTPGET, 1L);
   curl_easy_setopt(h->curl, CURLOPT_URL, url);
 
-  // request is empty
-  curl_easy_setopt(h->curl, CURLOPT_POSTFIELDSIZE, 0);
+  // set range to download
+  if (resume_from > 0)
+    curl_easy_setopt(h->curl, CURLOPT_RANGE, range);
 
   // setup response writer
   data.cb = write_cb;
@@ -413,7 +425,8 @@ gboolean http_post_stream_download(http* h, const gchar* url, http_data_fn write
   {
     if (curl_easy_getinfo(h->curl, CURLINFO_RESPONSE_CODE, &http_status) == CURLE_OK)
     {
-      if (http_status == 200)
+      // status code 206 is for partial downloads
+      if (http_status == 200 || http_status == 206)
       {
         status = TRUE;
         goto out;
@@ -436,6 +449,7 @@ gboolean http_post_stream_download(http* h, const gchar* url, http_data_fn write
 out:
   curl_easy_setopt(h->curl, CURLOPT_HTTPHEADER, NULL);
   curl_slist_free_all(headers);
+  g_free(range);
   return status;
 }
 

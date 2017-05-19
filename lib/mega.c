@@ -1682,6 +1682,35 @@ static gchar* path_simplify(const gchar* path)
 
 // }}}
 
+// Local filesystem helpers
+
+// {{{
+
+static gboolean get_partial_file_offset(GFile* file, goffset* resume_from, GError** err)
+{
+  gc_object_unref GFileInfo* info = g_file_query_info(file, G_FILE_ATTRIBUTE_STANDARD_SIZE, G_FILE_QUERY_INFO_NONE, NULL, err);
+
+  // if file is not found => no partial file, suppress error
+  if (g_error_matches(*err, G_IO_ERROR, G_IO_ERROR_NOT_FOUND))
+  {
+    g_clear_error(err);
+    return FALSE;
+  }
+
+  if (!info)
+  {
+    *resume_from = -1;
+    g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Can't query file info");
+    return FALSE;
+  }
+
+  *resume_from = g_file_info_get_size(info);
+  g_info("partial file detected, size: %lu bytes", *resume_from);
+  return TRUE;
+}
+
+// }}}
+
 // Public API helpers
 
 // {{{ send_status
@@ -3324,16 +3353,80 @@ static gsize get_process_data(gpointer buffer, gsize size, struct _get_data* dat
   return size;
 }
 
+// megaget; verifies partially downloaded file
+static gboolean partial_get_verify_data(GFile* file, gsize size, struct _get_data* data, GError** err)
+{
+  gc_object_unref GFileInputStream* partial_stream = NULL;
+  gc_byte_array_unref GByteArray* buffer = g_byte_array_new();
+  gc_error_free GError* local_err = NULL;
+  gsize bytes_read = 0;
+  gsize total_read = 0;
+  gsize CHUNK_SIZE = 16 * 1024;
+  goffset offset = 0;
+
+  g_debug("%s", "verifying partial file");
+
+  if (!data->buffer)
+  {
+    g_set_error(&local_err, MEGA_ERROR, MEGA_ERROR_OTHER, "File buffer not properly initialized");
+    g_propagate_error(err, local_err);
+    local_err = NULL;
+    return FALSE;
+  }
+
+  // verify partial file before downloading
+  partial_stream = g_file_read(file, NULL, &local_err);
+  if (!partial_stream)
+  {
+    g_propagate_prefixed_error(err, local_err, "Can't read partial file for verifying: ");
+    return FALSE;
+  }
+
+  if (CHUNK_SIZE > data->buffer->len || CHUNK_SIZE > buffer->len)
+  {
+    g_byte_array_set_size(buffer, CHUNK_SIZE);
+    g_byte_array_set_size(data->buffer, CHUNK_SIZE);
+  }
+
+  while (total_read < size)
+  {
+    if (!g_input_stream_read_all(G_INPUT_STREAM(partial_stream), buffer->data, CHUNK_SIZE, &bytes_read, NULL, &local_err))
+    {
+      g_printerr("ERROR: Failed reading from stream: %s\n", local_err->message);
+      return FALSE;
+    }
+
+    if (bytes_read > 0)
+    {
+      AES_ctr128_encrypt(buffer->data, data->buffer->data, bytes_read, &data->k, data->iv, data->ecount, &data->num);
+      chunked_cbc_mac_update(&data->mac, buffer->data, bytes_read);
+    }
+
+    total_read += bytes_read;
+  }
+
+  if (!g_input_stream_close(G_INPUT_STREAM(partial_stream), NULL, &local_err))
+  {
+      g_propagate_prefixed_error(err, local_err, "Can't close partial file: ");
+      return FALSE;
+  }
+
+  g_info("%s", "partial file verified");
+
+  return TRUE;
+}
+
 gboolean mega_session_get(mega_session* s, const gchar* local_path, const gchar* remote_path, GError** err)
 {
   struct _get_data data;
   GError* local_err = NULL;
   gc_object_unref GFile* file = NULL;
   gc_object_unref GFileOutputStream* stream = NULL;
-  gboolean remove_file = FALSE;
-  gc_free gchar* get_node = NULL, *url = NULL;
+  gc_free gchar* get_node = NULL, *url = NULL, *orig_fname = NULL;
   gc_http_free http* h = NULL;
   gc_byte_array_unref GByteArray* buffer = NULL;
+  gboolean partial_file = FALSE;
+  goffset resume_from = 0;
 
   g_return_val_if_fail(s != NULL, FALSE);
   g_return_val_if_fail(remote_path != NULL, FALSE);
@@ -3365,34 +3458,57 @@ gboolean mega_session_get(mega_session* s, const gchar* local_path, const gchar*
     {
       if (g_file_query_file_type(file, 0, NULL) == G_FILE_TYPE_DIRECTORY)
       {
-        gc_object_unref GFile* child = g_file_get_child(file, n->name);
+        GFile *child = g_file_get_child(file, n->name);
+
         if (g_file_query_exists(child, NULL))
         {
-          g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Local file already exists: %s/%s", local_path, n->name);
-          return FALSE;
+          gc_free gchar* path = g_file_get_path(child);
+          g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "File already exists: %s", path);
+          goto err;
         }
         else
         {
-          file = child;
-          child = NULL;
+          gc_free gchar* tmp = g_strdup_printf("%s%s", n->name, ".partial");
+          child = g_file_get_child(file, tmp);
         }
+
+        orig_fname = g_strdup(n->name);
+        file = child;
       }
       else
       {
-        g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Local file already exists: %s", local_path);
-        return FALSE;
+        gc_free gchar* path = g_file_get_path(file);
+        g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "File already exists: %s", path);
+        goto err;
       }
     }
+    else
+    {
+      gc_free gchar* tmpbname = g_file_get_basename(file);
+      gc_free gchar* tmpfname = g_strdup_printf("%s%s", tmpbname, ".partial");
+      orig_fname = g_strdup(tmpbname);
 
-    data.stream = stream = g_file_create(file, 0, NULL, &local_err);
+      gc_object_unref GFile* parent = g_file_get_parent(file);
+      file = g_file_get_child(parent, tmpfname);
+    }
+
+    // check if file is partially downloaded
+    partial_file = get_partial_file_offset(file, &resume_from, err);
+    if (resume_from == -1)
+      goto err;
+
+    // append to partial file, otherwise create new file
+    if (partial_file)
+      data.stream = stream = g_file_append_to(file, 0, NULL, &local_err);
+    else
+      data.stream = stream = g_file_create(file, 0, NULL, &local_err);
+
     if (!data.stream)
     {
       g_propagate_prefixed_error(err, local_err, "Can't open local file %s for writing: ", local_path);
       return FALSE;
     }
   }
-
-  remove_file = TRUE;
 
   // initialize decrytpion key/state
   guchar aes_key[16], meta_mac_xor[8];
@@ -3422,15 +3538,29 @@ gboolean mega_session_get(mega_session* s, const gchar* local_path, const gchar*
     goto err;
   }
 
+  // sanity check partial download conditions
+  if (resume_from >= file_size)
+  {
+    gc_free gchar* path = g_file_get_path(file);
+    g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Potential overwrite of file with same name: '%s'", path);
+    goto err;
+  }
+
   // setup buffer
   data.buffer = buffer = g_byte_array_new();
+
+  if (partial_file && !partial_get_verify_data(file, resume_from, &data, err))
+  {
+    g_propagate_prefixed_error(err, local_err, "Failed to verify partial file: ");
+    goto err;
+  }
 
   // perform download
   h = http_new();
   http_set_progress_callback(h, (http_progress_fn)progress_generic, s);
   http_set_speed(h, s->max_ul, s->max_dl);
   http_set_proxy(h, s->proxy);
-  if (!http_post_stream_download(h, url, (http_data_fn)get_process_data, &data, &local_err))
+  if (!http_get_stream_download(h, url, (http_data_fn)get_process_data, &data, file_size, resume_from, &local_err))
   {
     g_propagate_prefixed_error(err, local_err, "Data download failed: ");
     goto err;
@@ -3448,18 +3578,23 @@ gboolean mega_session_get(mega_session* s, const gchar* local_path, const gchar*
   // check mac of the downloaded file
   guchar meta_mac_xor_calc[8];
   chunked_cbc_mac_finish8(&data.mac, meta_mac_xor_calc);
-  if (memcmp(meta_mac_xor, meta_mac_xor_calc, 8) != 0) 
+  if (memcmp(meta_mac_xor, meta_mac_xor_calc, 8) != 0)
   {
     g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "MAC mismatch");
+    goto err;
+  }
+
+  // rename downloaded file, e.g. remove ".partial"
+  file = g_file_set_display_name(file, orig_fname, NULL, &local_err);
+  if (!file)
+  {
+    g_propagate_prefixed_error(err, local_err, "Failed to rename file: ");
     goto err;
   }
 
   return TRUE;
 
 err:
-  if (file && remove_file)
-    g_file_delete(file, NULL, NULL);
-
   return FALSE;
 }
 
@@ -3507,17 +3642,81 @@ static gsize dl_process_data(gpointer buffer, gsize size, struct _dl_data* data)
   return size;
 }
 
+// megadl; verifies partially downloaded file
+static gboolean partial_dl_verify_data(GFile* file, gsize size, struct _dl_data* data, GError** err)
+{
+  gc_object_unref GFileInputStream* partial_stream = NULL;
+  gc_byte_array_unref GByteArray* buffer = g_byte_array_new();
+  gc_error_free GError* local_err = NULL;
+  gsize bytes_read = 0;
+  gsize total_read = 0;
+  gsize CHUNK_SIZE = 16 * 1024;
+  goffset offset = 0;
+
+  g_debug("%s", "verifying partial file");
+
+  if (!data->buffer)
+  {
+    g_set_error(&local_err, MEGA_ERROR, MEGA_ERROR_OTHER, "File buffer not properly initialized");
+    g_propagate_error(err, local_err);
+    local_err = NULL;
+    return FALSE;
+  }
+
+  // verify partial file before downloading
+  partial_stream = g_file_read(file, NULL, &local_err);
+  if (!partial_stream)
+  {
+    g_propagate_prefixed_error(err, local_err, "Can't read partial file for verifying: ");
+    return FALSE;
+  }
+
+  if (CHUNK_SIZE > data->buffer->len || CHUNK_SIZE > buffer->len)
+  {
+    g_byte_array_set_size(buffer, CHUNK_SIZE);
+    g_byte_array_set_size(data->buffer, CHUNK_SIZE);
+  }
+
+  while (total_read < size)
+  {
+    if (!g_input_stream_read_all(G_INPUT_STREAM(partial_stream), buffer->data, CHUNK_SIZE, &bytes_read, NULL, &local_err))
+    {
+      g_printerr("ERROR: Failed reading from stream: %s\n", local_err->message);
+      return FALSE;
+    }
+
+    if (bytes_read > 0)
+    {
+      AES_ctr128_encrypt(buffer->data, data->buffer->data, bytes_read, &data->k, data->iv, data->ecount, &data->num);
+      chunked_cbc_mac_update(&data->mac, buffer->data, bytes_read);
+    }
+
+    total_read += bytes_read;
+  }
+
+  if (!g_input_stream_close(G_INPUT_STREAM(partial_stream), NULL, &local_err))
+  {
+      g_propagate_prefixed_error(err, local_err, "Can't close partial file: ");
+      return FALSE;
+  }
+
+  g_info("%s", "partial file verified");
+
+  return TRUE;
+}
+
 gboolean mega_session_dl(mega_session* s, const gchar* handle, const gchar* key, const gchar* local_path, GError** err)
 {
   struct _dl_data data;
   GError* local_err = NULL;
   gc_object_unref GFile *parent_dir = NULL, *file = NULL;
-  gboolean remove_file = FALSE;
-  gc_free gchar *node_name = NULL, *dl_node = NULL, *url = NULL, *at = NULL;
+  gc_free gchar *node_name = NULL, *dl_node = NULL, *url = NULL, *at = NULL, *partial_fname = NULL, *orig_fname = NULL;
   gc_free guchar* node_key = NULL;
   gc_http_free http* h = NULL;
   gc_object_unref GFileOutputStream* stream = NULL;
   gc_byte_array_unref GByteArray* buffer = NULL;
+  gboolean partial_file = FALSE;
+  goffset resume_from = 0;
 
   g_return_val_if_fail(s != NULL, FALSE);
   g_return_val_if_fail(handle != NULL, FALSE);
@@ -3533,13 +3732,17 @@ gboolean mega_session_dl(mega_session* s, const gchar* handle, const gchar* key,
     file = g_file_new_for_path(local_path);
     if (g_file_query_exists(file, NULL))
     {
-      if (g_file_query_file_type(file, 0, NULL) != G_FILE_TYPE_DIRECTORY)
+      GFileType file_type = g_file_query_file_type(file, 0, NULL);
+
+      if (file_type != G_FILE_TYPE_DIRECTORY)
       {
-        g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "File already exists: %s", local_path);
-        return FALSE;
+        gc_free gchar* path = g_file_get_path(file);
+        g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "File already exists: %s", path);
+        goto err;
       }
       else
       {
+        // |file| will be initialized later after getting |node_name|
         parent_dir = file;
         file = NULL;
       }
@@ -3550,8 +3753,16 @@ gboolean mega_session_dl(mega_session* s, const gchar* handle, const gchar* key,
 
       if (g_file_query_file_type(parent_dir, 0, NULL) != G_FILE_TYPE_DIRECTORY)
       {
-        g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Can't download file into: %s", g_file_get_path(parent_dir));
+        gc_free gchar* path = g_file_get_path(parent_dir);
+        g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Can't download file into: %s", path);
         return FALSE;
+      }
+      else
+      {
+        gc_free gchar* tmpbase = g_file_get_basename(file);
+        orig_fname = g_strdup(tmpbase);
+        partial_fname = g_strdup_printf("%s%s", tmpbase, ".partial");
+        file = g_file_get_child(parent_dir, partial_fname);
       }
     }
   }
@@ -3571,6 +3782,8 @@ gboolean mega_session_dl(mega_session* s, const gchar* handle, const gchar* key,
     g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Can't determine file size");
     goto err;
   }
+
+  g_debug("full download file_size: %lu", file_size);
 
   url = s_json_get_member_string(dl_node, "g");
   if (!url)
@@ -3635,23 +3848,56 @@ gboolean mega_session_dl(mega_session* s, const gchar* handle, const gchar* key,
   if (local_path)
   {
     if (!file)
+    {
+      // init file, check if file exists already
       file = g_file_get_child(parent_dir, node_name);
-  }
+      if (g_file_query_exists(file, NULL))
+      {
+        gc_free gchar* path = g_file_get_path(file);
+        g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "File already exists: %s", path);
+        goto err;
+      }
+      else
+      {
+        orig_fname = strdup(node_name);
+        partial_fname = g_strdup_printf("%s%s", node_name, ".partial");
+        file = g_file_get_child(parent_dir, partial_fname);
+      }
+    }
 
-  if (local_path)
-  {
-    // open local file for writing
-    data.stream = stream = g_file_create(file, 0, NULL, &local_err);
+    // check if file is partially downloaded
+    partial_file = get_partial_file_offset(file, &resume_from, err);
+    if (resume_from == -1)
+      goto err;
+
+    // sanity check partial download conditions
+    if (resume_from >= file_size)
+    {
+      gc_free gchar* path = g_file_get_path(file);
+      g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Potential overwrite of file with same name: '%s'", path);
+      goto err;
+    }
+
+    if (partial_file)
+    {
+      // open file to appending to it
+      data.stream = stream = g_file_append_to(file, 0, NULL, &local_err);
+      g_debug("%s", "appending to partial file");
+    }
+    else
+    {
+      // open file to create it
+      data.stream = stream = g_file_create(file, 0, NULL, &local_err);
+      g_debug("%s", "file does not exist, creating file");
+    }
+
     if (!data.stream)
     {
       gc_free gchar* tmp = g_file_get_path(file);
-
       g_propagate_prefixed_error(err, local_err, "Can't open local file %s for writing: ", tmp);
       goto err;
     }
   }
-
-  remove_file = TRUE;
 
   // initialize decryption and mac calculation
   AES_set_encrypt_key(aes_key, 128, &data.k);
@@ -3660,12 +3906,18 @@ gboolean mega_session_dl(mega_session* s, const gchar* handle, const gchar* key,
   // setup buffer
   data.buffer = buffer = g_byte_array_new();
 
+  if (partial_file && !partial_dl_verify_data(file, resume_from, &data, &local_err))
+  {
+    g_propagate_prefixed_error(err, local_err, "Failed to verify partial file: ");
+    goto err;
+  }
+
   // perform download
   h = http_new();
   http_set_progress_callback(h, (http_progress_fn)progress_generic, s);
   http_set_speed(h, s->max_ul, s->max_dl);
   http_set_proxy(h, s->proxy);
-  if (!http_post_stream_download(h, url, (http_data_fn)dl_process_data, &data, &local_err))
+  if (!http_get_stream_download(h, url, (http_data_fn)dl_process_data, &data, file_size, resume_from, &local_err))
   {
     g_propagate_prefixed_error(err, local_err, "Data download failed: ");
     goto err;
@@ -3689,12 +3941,17 @@ gboolean mega_session_dl(mega_session* s, const gchar* handle, const gchar* key,
     goto err;
   }
 
+  // rename downloaded file, e.g. remove ".partial"
+  file = g_file_set_display_name(file, orig_fname, NULL, &local_err);
+  if (!file)
+  {
+    g_propagate_prefixed_error(err, local_err, "Failed to rename file: ");
+    goto err;
+  }
+
   return TRUE;
 
 err:
-  if (file && remove_file)
-      g_file_delete(file, NULL, NULL);
-
   return FALSE;
 }
 

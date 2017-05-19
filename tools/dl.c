@@ -64,6 +64,9 @@ static gboolean dl_sync_file(mega_node* node, GFile* file, const gchar* remote_p
 {
   gc_error_free GError *local_err = NULL;
   gc_free gchar* local_path = g_file_get_path(file);
+  gint attempts = 0;
+  gint64 sleep_amt = 2000000;
+  gboolean status = TRUE;
 
   if (g_file_query_exists(file, NULL))
   {
@@ -74,13 +77,39 @@ static gboolean dl_sync_file(mega_node* node, GFile* file, const gchar* remote_p
   if (!opt_noprogress)
     g_print("F %s\n", local_path);
 
-  if (!mega_session_get(s, local_path, remote_path, &local_err))
+  while (attempts < 5)
   {
-    if (!opt_noprogress)
-      g_print("\r" ESC_CLREOL);
-    g_printerr("ERROR: Download failed for %s: %s\n", remote_path, local_err->message);
-    return FALSE;
+    if (attempts > 0)
+    {
+      g_print("Attempt #%d failed, trying again in %ld seconds...\n", attempts, sleep_amt / 1000000);
+      g_usleep(sleep_amt);
+      sleep_amt <<= 1;
+    }
+
+    if (!mega_session_get(s, local_path, remote_path, &local_err))
+    {
+      if (!opt_noprogress)
+        g_print("\r" ESC_CLREOL);
+      g_printerr("ERROR: Download failed for %s: %s\n", remote_path, local_err->message);
+      status = FALSE;
+      attempts++;
+
+      // only retry failed downloads, e.g. HTTP_ERROR
+      // treat the rest of errors as failure, do not retry
+      if (g_error_matches(local_err, MEGA_ERROR, MEGA_ERROR_OTHER))
+        break;
+      else
+        g_clear_error(&local_err);
+    }
+    else
+    {
+      status = TRUE;
+      break;
+    }
   }
+
+  if (!status)
+    return FALSE;
 
   if (!opt_noprogress)
     g_print("\r" ESC_CLREOL);
@@ -203,21 +232,46 @@ int main(int ac, char* av[])
       handle = g_match_info_fetch(m1, 1);
       key = g_match_info_fetch(m1, 2);
 
-      // perform download
-      if (!mega_session_dl(s, handle, key, opt_stream ? NULL : opt_path, &local_err))
+      gint attempts = 0;
+      gint64 sleep_amt = 2000000;
+      while (attempts < 5)
       {
-        if (!opt_noprogress)
-          g_print("\r" ESC_CLREOL "\n");
-        g_printerr("ERROR: Download failed for '%s': %s\n", link, local_err->message);
-        g_clear_error(&local_err);
-        status = 1;
-      }
-      else
-      {
-        if (!opt_noprogress)
-          g_print("\r" ESC_CLREOL "Downloaded %s\n", cur_file);
-        if (opt_print_names)
-          g_print("%s\n", cur_file);
+        if (attempts > 0)
+        {
+          g_print("Attempt #%d failed, trying again in %ld seconds...\n", attempts, sleep_amt / 1000000);
+          g_usleep(sleep_amt);
+          sleep_amt <<= 1;
+        }
+
+        // perform download
+        if (!mega_session_dl(s, handle, key, opt_stream ? NULL : opt_path, &local_err))
+        {
+          if (!opt_noprogress)
+            g_print("\r" ESC_CLREOL "\n");
+          g_printerr("ERROR: Download failed for '%s': %s\n", link, local_err->message);
+          status = 1;
+          attempts++;
+
+          // only retry failed downloads, e.g. HTTP_ERROR
+          // treat the rest of errors as failure, do not retry
+          if (g_error_matches(local_err, MEGA_ERROR, MEGA_ERROR_OTHER))
+          {
+            g_clear_error(&local_err);
+            break;
+          }
+
+          g_clear_error(&local_err);
+        }
+        else
+        {
+          if (!opt_noprogress)
+            g_print("\r" ESC_CLREOL "Downloaded %s\n", cur_file);
+          if (opt_print_names)
+            g_print("%s\n", cur_file);
+
+          status = 0;
+          break;
+        }
       }
     }
     else if (g_regex_match(folder_regex, link, 0, &m2))

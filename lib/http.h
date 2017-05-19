@@ -52,7 +52,7 @@ void http_set_proxy(http* h, const gchar* proxy);
 
 GString* http_post(http* h, const gchar* url, const gchar* body, gssize body_len, GError** err);
 GString* http_post_stream_upload(http* h, const gchar* url, goffset len, http_data_fn read_cb, gpointer user_data, GError** err);
-gboolean http_post_stream_download(http* h, const gchar* url, http_data_fn write_cb, gpointer user_data, GError** err);
+gboolean http_get_stream_download(http* h, const gchar* url, http_data_fn write_cb, gpointer user_data, gint64 file_size, goffset resume_from, GError** err);
 
 void http_free(http* h);
 
